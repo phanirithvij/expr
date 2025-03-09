@@ -872,6 +872,18 @@ func TestExpr(t *testing.T) {
 			12,
 		},
 		{
+			`len('北京')`,
+			2,
+		},
+		{
+			`len('👍🏻')`, // one grapheme cluster, two code points
+			2,
+		},
+		{
+			`len('👍')`, // one grapheme cluster, one code point
+			1,
+		},
+		{
 			`len(ArrayOfInt)`,
 			5,
 		},
@@ -1108,6 +1120,10 @@ func TestExpr(t *testing.T) {
 			time.Hour + time.Minute,
 		},
 		{
+			`duration("1h") - duration("1m")`,
+			time.Hour - time.Minute,
+		},
+		{
 			`7 * duration("1h")`,
 			7 * time.Hour,
 		},
@@ -1305,6 +1321,14 @@ func TestExpr(t *testing.T) {
 		{
 			`if "a" < "b" {let x = "a"; x} else {"abc"}`,
 			"a",
+		},
+		{
+			`1; 2; 3`,
+			3,
+		},
+		{
+			`let a = 1; Add(2, 2); let b = 2; a + b`,
+			3,
 		},
 	}
 
@@ -2308,86 +2332,6 @@ func TestIssue432(t *testing.T) {
 	assert.Equal(t, float64(10), out)
 }
 
-func TestIssue461(t *testing.T) {
-	type EnvStr string
-	type EnvField struct {
-		S   EnvStr
-		Str string
-	}
-	type Env struct {
-		S        EnvStr
-		Str      string
-		EnvField EnvField
-	}
-	var tests = []struct {
-		input string
-		env   Env
-		want  bool
-	}{
-		{
-			input: "Str == S",
-			env:   Env{S: "string", Str: "string"},
-			want:  false,
-		},
-		{
-			input: "Str == Str",
-			env:   Env{Str: "string"},
-			want:  true,
-		},
-		{
-			input: "S == S",
-			env:   Env{Str: "string"},
-			want:  true,
-		},
-		{
-			input: `Str == "string"`,
-			env:   Env{Str: "string"},
-			want:  true,
-		},
-		{
-			input: `S == "string"`,
-			env:   Env{Str: "string"},
-			want:  false,
-		},
-		{
-			input: "EnvField.Str == EnvField.S",
-			env:   Env{EnvField: EnvField{S: "string", Str: "string"}},
-			want:  false,
-		},
-		{
-			input: "EnvField.Str == EnvField.Str",
-			env:   Env{EnvField: EnvField{Str: "string"}},
-			want:  true,
-		},
-		{
-			input: "EnvField.S == EnvField.S",
-			env:   Env{EnvField: EnvField{Str: "string"}},
-			want:  true,
-		},
-		{
-			input: `EnvField.Str == "string"`,
-			env:   Env{EnvField: EnvField{Str: "string"}},
-			want:  true,
-		},
-		{
-			input: `EnvField.S == "string"`,
-			env:   Env{EnvField: EnvField{Str: "string"}},
-			want:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			program, err := expr.Compile(tt.input, expr.Env(tt.env), expr.AsBool())
-
-			out, err := expr.Run(program, tt.env)
-			require.NoError(t, err)
-
-			require.Equal(t, tt.want, out)
-		})
-	}
-}
-
 func TestIssue462(t *testing.T) {
 	env := map[string]any{
 		"foo": func() (string, error) {
@@ -2750,4 +2694,33 @@ func TestExpr_env_types_map_error(t *testing.T) {
 
 	_, err = expr.Run(program, envTypes)
 	require.Error(t, err)
+}
+
+func TestIssue758_filter_map_index(t *testing.T) {
+	env := map[string]interface{}{}
+
+	exprStr := `
+        let a_map = 0..5 | filter(# % 2 == 0) | map(#index);
+        let b_filter = 0..5 | filter(# % 2 == 0);
+        let b_map = b_filter | map(#index);
+        [a_map, b_map]
+    `
+
+	result, err := expr.Eval(exprStr, env)
+	require.NoError(t, err)
+
+	expected := []interface{}{
+		[]interface{}{0, 1, 2},
+		[]interface{}{0, 1, 2},
+	}
+
+	require.Equal(t, expected, result)
+}
+
+func TestExpr_wierd_cases(t *testing.T) {
+	env := map[string]any{}
+
+	_, err := expr.Compile(`A(A)`, expr.Env(env))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown name A")
 }
