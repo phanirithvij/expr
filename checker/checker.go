@@ -13,6 +13,40 @@ import (
 	"github.com/expr-lang/expr/parser"
 )
 
+// Run visitors in a given config over the given tree
+// runRepeatable controls whether to filter for only vistors that require multiple passes or not
+func runVisitors(tree *parser.Tree, config *conf.Config, runRepeatable bool) {
+	for {
+		more := false
+		for _, v := range config.Visitors {
+			// We need to perform types check, because some visitors may rely on
+			// types information available in the tree.
+			_, _ = Check(tree, config)
+
+			r, repeatable := v.(interface {
+				Reset()
+				ShouldRepeat() bool
+			})
+
+			if repeatable {
+				if runRepeatable {
+					r.Reset()
+					ast.Walk(&tree.Node, v)
+					more = more || r.ShouldRepeat()
+				}
+			} else {
+				if !runRepeatable {
+					ast.Walk(&tree.Node, v)
+				}
+			}
+		}
+
+		if !more {
+			break
+		}
+	}
+}
+
 // ParseCheck parses input expression and checks its types. Also, it applies
 // all provided patchers. In case of error, it returns error with a tree.
 func ParseCheck(input string, config *conf.Config) (*parser.Tree, error) {
@@ -22,25 +56,11 @@ func ParseCheck(input string, config *conf.Config) (*parser.Tree, error) {
 	}
 
 	if len(config.Visitors) > 0 {
-		for i := 0; i < 1000; i++ {
-			more := false
-			for _, v := range config.Visitors {
-				// We need to perform types check, because some visitors may rely on
-				// types information available in the tree.
-				_, _ = Check(tree, config)
+		// Run all patchers that dont support being run repeatedly first
+		runVisitors(tree, config, false)
 
-				ast.Walk(&tree.Node, v)
-
-				if v, ok := v.(interface {
-					ShouldRepeat() bool
-				}); ok {
-					more = more || v.ShouldRepeat()
-				}
-			}
-			if !more {
-				break
-			}
-		}
+		// Run patchers that require multiple passes next (currently only Operator patching)
+		runVisitors(tree, config, true)
 	}
 	_, err = Check(tree, config)
 	if err != nil {
@@ -158,6 +178,8 @@ func (v *checker) visit(node ast.Node) Nature {
 		nt = v.PointerNode(n)
 	case *ast.VariableDeclaratorNode:
 		nt = v.VariableDeclaratorNode(n)
+	case *ast.SequenceNode:
+		nt = v.SequenceNode(n)
 	case *ast.ConditionalNode:
 		nt = v.ConditionalNode(n)
 	case *ast.ArrayNode:
@@ -195,7 +217,7 @@ func (v *checker) IdentifierNode(node *ast.IdentifierNode) Nature {
 		return unknown
 	}
 
-	return v.ident(node, node.Value, v.config.Env.Strict, true)
+	return v.ident(node, node.Value, v.config.Strict, true)
 }
 
 // ident method returns type of environment variable, builtin or function.
@@ -297,7 +319,10 @@ func (v *checker) BinaryNode(node *ast.BinaryNode) Nature {
 		if isTime(l) && isTime(r) {
 			return boolNature
 		}
-		if or(l, r, isNumber, isString, isTime) {
+		if isDuration(l) && isDuration(r) {
+			return boolNature
+		}
+		if or(l, r, isNumber, isString, isTime, isDuration) {
 			return boolNature
 		}
 
@@ -311,6 +336,9 @@ func (v *checker) BinaryNode(node *ast.BinaryNode) Nature {
 		if isTime(l) && isDuration(r) {
 			return timeNature
 		}
+		if isDuration(l) && isDuration(r) {
+			return durationNature
+		}
 		if or(l, r, isNumber, isTime, isDuration) {
 			return unknown
 		}
@@ -319,7 +347,16 @@ func (v *checker) BinaryNode(node *ast.BinaryNode) Nature {
 		if isNumber(l) && isNumber(r) {
 			return combined(l, r)
 		}
-		if or(l, r, isNumber) {
+		if isNumber(l) && isDuration(r) {
+			return durationNature
+		}
+		if isDuration(l) && isNumber(r) {
+			return durationNature
+		}
+		if isDuration(l) && isDuration(r) {
+			return durationNature
+		}
+		if or(l, r, isNumber, isDuration) {
 			return unknown
 		}
 
@@ -359,6 +396,9 @@ func (v *checker) BinaryNode(node *ast.BinaryNode) Nature {
 		}
 		if isDuration(l) && isTime(r) {
 			return timeNature
+		}
+		if isDuration(l) && isDuration(r) {
+			return durationNature
 		}
 		if or(l, r, isNumber, isString, isTime, isDuration) {
 			return unknown
@@ -515,6 +555,14 @@ func (v *checker) MemberNode(node *ast.MemberNode) Nature {
 		}
 	}
 
+	// Not found.
+
+	if name, ok := node.Property.(*ast.StringNode); ok {
+		if node.Method {
+			return v.error(node, "type %v has no method %v", base, name.Value)
+		}
+		return v.error(node, "type %v has no field %v", base, name.Value)
+	}
 	return v.error(node, "type %v[%v] is undefined", base, prop)
 }
 
@@ -612,7 +660,7 @@ func (v *checker) functionReturnType(node *ast.CallNode) Nature {
 func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 	switch node.Name {
 	case "all", "none", "any", "one":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -633,7 +681,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "filter":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -657,7 +705,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "map":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -675,7 +723,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "count":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -700,7 +748,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "sum":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -723,7 +771,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		}
 
 	case "find", "findLast":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -747,7 +795,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "findIndex", "findLastIndex":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -768,7 +816,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "groupBy":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -787,7 +835,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "sortBy":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -809,7 +857,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		return v.error(node.Arguments[1], "predicate should has one input and one output param")
 
 	case "reduce":
-		collection := v.visit(node.Arguments[0])
+		collection := v.visit(node.Arguments[0]).Deref()
 		if !isArray(collection) && !isUnknown(collection) {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
 		}
@@ -927,6 +975,14 @@ func (v *checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 			lastErr = err
 			continue
 		}
+
+		// As we found the correct function overload, we can stop the loop.
+		// Also, we need to set the correct nature of the callee so compiler,
+		// can correctly handle OpDeref opcode.
+		if callNode, ok := node.(*ast.CallNode); ok {
+			callNode.Callee.SetType(t)
+		}
+
 		return outNature
 	}
 	if lastErr != nil {
@@ -1151,6 +1207,17 @@ func (v *checker) VariableDeclaratorNode(node *ast.VariableDeclaratorNode) Natur
 	exprNature := v.visit(node.Expr)
 	v.varScopes = v.varScopes[:len(v.varScopes)-1]
 	return exprNature
+}
+
+func (v *checker) SequenceNode(node *ast.SequenceNode) Nature {
+	if len(node.Nodes) == 0 {
+		return v.error(node, "empty sequence expression")
+	}
+	var last Nature
+	for _, node := range node.Nodes {
+		last = v.visit(node)
+	}
+	return last
 }
 
 func (v *checker) lookupVariable(name string) (varScope, bool) {
