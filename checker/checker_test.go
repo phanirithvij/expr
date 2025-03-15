@@ -671,6 +671,14 @@ invalid operation: > (mismatched types string and int) (1:30)
  | .............................^
 `,
 		},
+		{
+			`1; 2 + true; 3`,
+			`
+invalid operation: + (mismatched types int and bool) (1:6)
+ | 1; 2 + true; 3
+ | .....^
+`,
+		},
 	}
 
 	for _, tt := range errorTests {
@@ -1055,7 +1063,7 @@ func TestCheck_builtin_without_call(t *testing.T) {
 		err   string
 	}{
 		{`len + 1`, "invalid operation: + (mismatched types func(...interface {}) (interface {}, error) and int) (1:5)\n | len + 1\n | ....^"},
-		{`string.A`, "type func(interface {}) string[string] is undefined (1:8)\n | string.A\n | .......^"},
+		{`string.A`, "type func(interface {}) string has no field A (1:8)\n | string.A\n | .......^"},
 	}
 
 	for _, test := range tests {

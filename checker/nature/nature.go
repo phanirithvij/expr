@@ -25,6 +25,20 @@ type Nature struct {
 	FieldIndex      []int             // Index of field in type.
 }
 
+func (n Nature) IsAny() bool {
+	return n.Kind() == reflect.Interface && n.NumMethods() == 0
+}
+
+func (n Nature) IsUnknown() bool {
+	switch {
+	case n.Type == nil && !n.Nil:
+		return true
+	case n.IsAny():
+		return true
+	}
+	return false
+}
+
 func (n Nature) String() string {
 	if n.Type != nil {
 		return n.Type.String()
@@ -74,7 +88,7 @@ func (n Nature) Elem() Nature {
 func (n Nature) AssignableTo(nt Nature) bool {
 	if n.Nil {
 		// Untyped nil is assignable to any interface, but implements only the empty interface.
-		if nt.Type != nil && nt.Type.Kind() == reflect.Interface {
+		if nt.IsAny() {
 			return true
 		}
 	}
@@ -82,6 +96,13 @@ func (n Nature) AssignableTo(nt Nature) bool {
 		return false
 	}
 	return n.Type.AssignableTo(nt.Type)
+}
+
+func (n Nature) NumMethods() int {
+	if n.Type == nil {
+		return 0
+	}
+	return n.Type.NumMethod()
 }
 
 func (n Nature) MethodByName(name string) (Nature, bool) {
@@ -152,6 +173,13 @@ func (n Nature) FieldByName(name string) (Nature, bool) {
 	}
 	field, ok := fetchField(n.Type, name)
 	return Nature{Type: field.Type, FieldIndex: field.Index}, ok
+}
+
+func (n Nature) PkgPath() string {
+	if n.Type == nil {
+		return ""
+	}
+	return n.Type.PkgPath()
 }
 
 func (n Nature) IsFastMap() bool {
